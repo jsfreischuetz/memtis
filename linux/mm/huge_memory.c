@@ -2132,10 +2132,15 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	}
 #ifdef CONFIG_HTMM
 	/* pginfo-s managed by the huge page should be copied into pte->pginfo*/
-	if (PageHtmm(&page[3])) {
-	    struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
+	if (PageAnon(page) && PageHtmm(&page[3])) {
+	    struct mem_cgroup *memcg = page_memcg(page);
 	    pte_t *pte = pte_offset_map(&_pmd, haddr);
-	
+
+	    if (!memcg || !READ_ONCE(memcg->htmm_enabled) ||
+	        !get_pginfo_from_pte(pte)) {
+	        pte_unmap(pte);
+	        goto skip_copy_pginfo;
+	    }
 	    SetPageHtmm(&page[0]);
 
 	    for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
@@ -2144,13 +2149,11 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		pte_pginfo = get_pginfo_from_pte(&pte[i]);
 		tail_pginfo = get_compound_pginfo(page, addr);
 		if (!pte_pginfo || !tail_pginfo) {
-		    printk("split - pginfo - none...\n");
+		    pte_unmap(pte);
 		    goto skip_copy_pginfo;
 		}
 
-		pte_pginfo->nr_accesses = tail_pginfo->nr_accesses;
-		pte_pginfo->total_accesses = tail_pginfo->total_accesses;
-		pte_pginfo->cooling_clock = tail_pginfo->cooling_clock;
+		*pte_pginfo = *tail_pginfo;
 		
 		if (get_idx(pte_pginfo->total_accesses) >= (memcg->active_threshold - 1))
 		    SetPageActive(&page[i]);
@@ -2163,6 +2166,7 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		/* Htmm flag will be cleared later */
 		/* ClearPageHtmm(&page[i]); */
 	    }
+	    pte_unmap(pte);
 	}
 skip_copy_pginfo:
 #endif
@@ -2706,6 +2710,31 @@ bool can_split_huge_page(struct page *page, int *pextra_pins)
 	return total_mapcount(page) == page_count(page) - extra_pins - 1;
 }
 
+#ifdef CONFIG_HTMM
+static void uncharge_split_huge_page_for_htmm(struct page *head)
+{
+    struct mem_cgroup *memcg = page_memcg(head);
+    unsigned int idx;
+
+    /* Generic reclaim also splits shmem/file and non-HTMM anonymous THPs.
+     * Their third tail page is not a MEMTIS histogram record.
+     */
+    if (!memcg || !READ_ONCE(memcg->htmm_enabled) ||
+        !PageAnon(head) || !PageHtmm(&head[3]))
+        return;
+
+    spin_lock(&memcg->access_lock);
+    idx = head[3].idx;
+    if (idx < ARRAY_SIZE(memcg->hotness_hg)) {
+        if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
+            memcg->hotness_hg[idx] = 0;
+        else
+            memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
+    }
+    spin_unlock(&memcg->access_lock);
+}
+#endif
+
 /*
  * This function splits huge page into normal pages. @page can point to any
  * subpage of huge page to split. Split doesn't change the position of @page.
@@ -2828,20 +2857,7 @@ int split_huge_page_to_list(struct page *page, struct list_head *list)
 			}
 		}
 #ifdef CONFIG_HTMM
-		{
-		    struct mem_cgroup *memcg = page_memcg(head);
-		    unsigned int idx;
-
-		    spin_lock(&memcg->access_lock);
-		    idx = head[3].idx;
-
-		    if (memcg->hotness_hg[idx] < HPAGE_PMD_NR)
-			memcg->hotness_hg[idx] = 0;
-		    else
-			memcg->hotness_hg[idx] -= HPAGE_PMD_NR;
-
-		    spin_unlock(&memcg->access_lock);
-		}
+		uncharge_split_huge_page_for_htmm(head);
 #endif
 		__split_huge_page(page, list, end);
 		ret = 0;

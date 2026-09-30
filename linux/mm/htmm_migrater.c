@@ -702,6 +702,11 @@ static unsigned long cooling_active_list(unsigned long nr_to_scan,
 		    if (deferred_split_huge_page_for_htmm(compound_head(page))) {
 			spin_unlock_irq(&lruvec->lru_lock);
 			check_transhuge_cooling((void *)memcg, page, false);
+			/* The queue is non-owning. Release our isolation reference
+			 * and restore LRU membership before the scanner can isolate
+			 * this page for splitting. Unmapping may free it meanwhile.
+			 */
+			putback_lru_page(page);
 			continue;
 		    }
 		    spin_unlock_irq(&lruvec->lru_lock);
@@ -828,13 +833,15 @@ static unsigned long adjusting_lru_list(unsigned long nr_to_scan,
 	if (PageCompound(page) && check_split_huge_page(memcg, get_meta_page(page), false)) {
 
 	    spin_lock_irq(&lruvec->lru_lock);
-	    if (!deferred_split_huge_page_for_htmm(compound_head(page))) {
-	        if (PageActive(page))
-		    list_add(&page->lru, &l_active);
-		else
-		    list_add(&page->lru, &l_inactive);
-	    }
+	    deferred_split_huge_page_for_htmm(compound_head(page));
 	    spin_unlock_irq(&lruvec->lru_lock);
+	    /* Keep ownership in the normal putback path even when queued.
+	     * The deferred queue must never retain our isolation reference.
+	     */
+	    if (PageActive(page))
+		list_add(&page->lru, &l_active);
+	    else
+		list_add(&page->lru, &l_inactive);
 	    continue;
 	}
 #endif
@@ -937,7 +944,7 @@ static struct mem_cgroup_per_node *next_memcg_cand(pg_data_t *pgdat)
 
 static int kmigraterd_demotion(pg_data_t *pgdat)
 {
-    const struct cpumask *cpumask = cpumask_of_node(pgdat->node_id);
+    const struct cpumask *cpumask = cpumask_of_node(0);
 
     if (!cpumask_empty(cpumask))
 	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);
@@ -1001,12 +1008,7 @@ static int kmigraterd_demotion(pg_data_t *pgdat)
 
 static int kmigraterd_promotion(pg_data_t *pgdat)
 {
-    const struct cpumask *cpumask;
-
-    if (htmm_cxl_mode)
-    	cpumask = cpumask_of_node(pgdat->node_id);
-    else
-	cpumask = cpumask_of_node(pgdat->node_id - 2);
+    const struct cpumask *cpumask = cpumask_of_node(0);
 
     if (!cpumask_empty(cpumask))
 	set_cpus_allowed_ptr(pgdat->kmigraterd, cpumask);

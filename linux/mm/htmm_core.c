@@ -20,6 +20,27 @@
 #include "internal.h"
 #include <asm/pgtable.h>
 
+pginfo_t *get_pginfo_from_pte(pte_t *pte)
+{
+    struct page *page = virt_to_page((unsigned long)pte);
+    pginfo_t *pginfo;
+    unsigned long idx;
+
+    /* Ordinary page tables (and failed metadata allocations) have no
+     * pginfo array. Test the base before adding the PTE offset: NULL + idx
+     * is non-NULL for every entry except the first one.
+     * The caller must stabilize the page table with its page-table lock.
+     */
+    if (!PageHtmm(page))
+        return NULL;
+    pginfo = READ_ONCE(page->pginfo);
+    if (!pginfo)
+        return NULL;
+
+    idx = ((unsigned long)pte & ~PAGE_MASK) / sizeof(*pte);
+    return &pginfo[idx];
+}
+
 void htmm_mm_init(struct mm_struct *mm)
 {
     struct mem_cgroup *memcg = get_mem_cgroup_from_mm(mm);
@@ -122,13 +143,16 @@ void copy_transhuge_pginfo(struct page *page,
 	idx = 4 + i / 4;
 	offset = i % 4;
 
-	newpage[idx].compound_pginfo[offset].nr_accesses =
-			page[idx].compound_pginfo[offset].nr_accesses;
-	newpage[idx].compound_pginfo[offset].total_accesses =
-			page[idx].compound_pginfo[offset].total_accesses;
+	/* Preserve cooling_clock and may_hot as well as the counters. */
+	newpage[idx].compound_pginfo[offset] =
+			page[idx].compound_pginfo[offset];
 	
 	page[idx].compound_pginfo[offset] = zero_pginfo;
-	page[idx].mapping = TAIL_MAPPING;
+	/* mapping aliases compound_pginfo[1]. Restore the tail sentinel
+	 * only after all four records in this struct page were copied.
+	 */
+	if (offset == 3)
+	    page[idx].mapping = TAIL_MAPPING;
 	SetPageHtmm(&newpage[idx]);
     }
 }
@@ -156,6 +180,8 @@ void check_transhuge_cooling(void *arg, struct page *page, bool locked)
 	return;
 
     meta_page = get_meta_page(page);
+    if (!PageHtmm(meta_page))
+        return;
 
     spin_lock(&memcg->access_lock);
     /* check cooling */
@@ -386,99 +412,80 @@ unsigned long deferred_split_scan_for_htmm(struct mem_cgroup_per_node *pn,
 	struct list_head *split_list)
 {
     struct deferred_split *ds_queue = &pn->deferred_split_queue;
-    //struct list_head *deferred_list = &pn->deferred_list;
     unsigned long flags;
     LIST_HEAD(list), *pos, *next;
-    LIST_HEAD(failed_list);
     struct page *page;
-    unsigned int nr_max = 50; // max: 100MB
+    const int nr_max = 50; /* Limit successful splits, as upstream does. */
     int split = 0;
 
     spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+    /*
+     * Match the deferred-split shrinker's lifetime rule: pin every page
+     * before moving its deferred_list off the shared queue. page_count()
+     * alone cannot stop free_transhuge_page() racing with our traversal.
+     */
     list_for_each_safe(pos, next, &ds_queue->split_queue) {
-	page = list_entry((void *)pos, struct page, deferred_list);
-	page = compound_head(page);
-    
-	if (page_count(page) < 1) {
+	page = compound_head(list_entry((void *)pos, struct page, deferred_list));
+	if (get_page_unless_zero(page)) {
+	    list_move(page_deferred_list(page), &list);
+	} else {
 	    list_del_init(page_deferred_list(page));
 	    ds_queue->split_queue_len--;
-	}
-	else { 
-	    list_move(page_deferred_list(page), &list);
 	}
     }
     spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
 
     list_for_each_safe(pos, next, &list) {
 	LIST_HEAD(tmp);
-	struct lruvec *lruvec = mem_cgroup_page_lruvec(page);
-	bool skip_iso = false;
 
+	page = compound_head(list_entry((void *)pos, struct page, deferred_list));
+	/* Stop splitting at the upstream success limit, but release every
+	 * remaining snapshot pin before requeueing the unprocessed pages.
+	 */
 	if (split >= nr_max)
-	    break;
+	    goto next_page;
+	if (!trylock_page(page))
+	    goto next_page;
 
-	page = list_entry((void *)pos, struct page, deferred_list);
-	page = compound_head(page);
+	/* Resolve the LRU owner for this page, not the previous iteration. */
+	if (!PageTransHuge(page) || mem_cgroup_page_lruvec(page) != &pn->lruvec)
+	    goto unlock;
 
-	if (!PageLRU(page)) {
-	    skip_iso = true;
-	    goto skip_isolation;
-	}
+	/* A page already isolated by reclaim/migration belongs to that caller. */
+	if (isolate_lru_page(page))
+	    goto unlock;
 
-	if (lruvec != &pn->lruvec) {
-	    continue;
-	}
-
-	spin_lock_irq(&lruvec->lru_lock);
-	if (!__isolate_lru_page_prepare(page, 0)) {
-	    spin_unlock_irq(&lruvec->lru_lock);
-	    continue;
-	}
-
-	if (unlikely(!get_page_unless_zero(page))) {
-	    spin_unlock_irq(&lruvec->lru_lock);
-	    continue;
-	}
-
-	if (!TestClearPageLRU(page)) {
-	    put_page(page);
-	    spin_unlock_irq(&lruvec->lru_lock); 
-	    continue;
-	}
-    
-	list_move(&page->lru, &tmp);
-	update_lru_size(lruvec, page_lru(page), page_zonenum(page),
-		    -thp_nr_pages(page));
-	spin_unlock_irq(&lruvec->lru_lock);
-skip_isolation:
-	if (skip_iso) {
-	    if (page->lru.next != LIST_POISON1 || page->lru.prev != LIST_POISON2)
-		continue;
-	    list_add(&page->lru, &tmp);
-	}
-	
-	if (!trylock_page(page)) {
-	    list_splice_tail(&tmp, split_list);
-	    continue;
-	}
-
+	/*
+	 * isolate_lru_page() took its own reference. Drop our scan pin so
+	 * split_huge_page_to_list() sees exactly one caller reference.
+	 * The isolation reference is transferred to split_list on success,
+	 * or released by putback_lru_page() on failure.
+	 */
+	put_page(page);
+	list_add(&page->lru, &tmp);
 	if (!split_huge_page_to_list(page, &tmp)) {
 	    split++;
-	    list_splice(&tmp, split_list);
+	    list_splice_tail_init(&tmp, split_list);
+	    unlock_page(page);
 	} else {
-	    check_failed_list(pn, &tmp, &failed_list);
+	    list_del_init(&page->lru);
+	    unlock_page(page);
+	    /* No split occurred, so neither histogram nor isolated counters
+	     * need undoing. isolate_lru_page() does not bump NR_ISOLATED. */
+	    putback_lru_page(page);
 	}
-
+	continue;
+unlock:
 	unlock_page(page);
+next_page:
+	put_page(page);
     }
-    putback_movable_pages(&failed_list);
 
-    /* handle list and failed_list */
-    spin_lock_irqsave(&ds_queue->split_queue_lock, flags); 
-    list_splice_tail(&list, &ds_queue->split_queue);
+    /* Retry pages which were busy or could not be split this pass. */
+    spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+    list_splice_tail_init(&list, &ds_queue->split_queue);
     spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
-    
-    putback_movable_pages(&failed_list); 
+
     if (split)
 	pn->memcg->split_happen = true;
     return split;
@@ -625,20 +632,25 @@ void uncharge_htmm_page(struct page *page, struct mem_cgroup *memcg)
     unsigned int idx;
     int i;
 
-    if (!memcg || !memcg->htmm_enabled)
+    if (!memcg || !READ_ONCE(memcg->htmm_enabled))
 	return;
-    
+
     page = compound_head(page);
     if (nr_pages != 1) { // hugepage
 	struct page *meta = get_meta_page(page);
 
-	idx = meta->idx;
+	/* zap_huge_pmd() also unmaps untracked and file/shmem THPs. */
+	if (!PageAnon(page) || !PageHtmm(meta))
+	    return;
 
 	spin_lock(&memcg->access_lock);
-	if (memcg->hotness_hg[idx] >= nr_pages)
-	    memcg->hotness_hg[idx] -= nr_pages;
-	else
-	    memcg->hotness_hg[idx] = 0;
+	idx = meta->idx;
+	if (idx < ARRAY_SIZE(memcg->hotness_hg)) {
+	    if (memcg->hotness_hg[idx] >= nr_pages)
+		memcg->hotness_hg[idx] -= nr_pages;
+	    else
+		memcg->hotness_hg[idx] = 0;
+	}
 	
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
 	    int base_idx = 4 + i / 4;
@@ -712,6 +724,11 @@ bool check_split_huge_page(struct mem_cgroup *memcg,
     unsigned long split_thres_tail = split_thres - 1;
     bool tail_idx = false;
    
+    /* Only initialized THPs have a valid access-map index. */
+    if (!PageHtmm(meta) ||
+        meta->skewness_idx >= ARRAY_SIZE(memcg->access_map))
+        return false;
+
     /* check split enable/disable status */
     if (htmm_thres_split == 0)
 	return false;
@@ -1028,56 +1045,45 @@ pte_unlock:
 }
 
 static int __update_pmd_pginfo(struct vm_area_struct *vma, pud_t *pud,
-				unsigned long address)
+                                unsigned long address)
 {
-    pmd_t *pmd, pmdval;
-    bool ret = 0;
+    pmd_t *pmd = pmd_offset(pud, address);
+    spinlock_t *ptl;
+    int ret = 0;
 
-    pmd = pmd_offset(pud, address);
-    if (!pmd || pmd_none(*pmd))
-	return ret;
-    
-    if (is_swap_pmd(*pmd))
-	return ret;
+    /* mmap_lock alone does not serialize THP split/migration. Hold the
+     * PMD lock until sampling has finished using the tail-page metadata.
+     */
+    ptl = pmd_trans_huge_lock(pmd, vma);
+    if (ptl) {
+        pmd_t pmdval = *pmd;
+        struct page *page;
 
-    if (!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd) && unlikely(pmd_bad(*pmd))) {
-	pmd_clear_bad(pmd);
-	return ret;
-    }
+        if (!pmd_present(pmdval) || pmd_devmap(pmdval) ||
+            !pmd_trans_huge(pmdval) || is_huge_zero_pmd(pmdval))
+            goto pmd_unlock;
 
-    pmdval = *pmd;
-    if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval)) {
-	struct page *page;
+        page = pmd_page(pmdval);
+        /* THPs created before HTMM was enabled, and file THPs, do not
+         * necessarily have initialized MEMTIS tail-page metadata.
+         */
+        if (!PageTransHuge(page) || !PageAnon(page) ||
+            !PageHtmm(&page[3]))
+            goto pmd_unlock;
 
-	if (is_huge_zero_pmd(pmdval))
-	    return ret;
-	
-	page = pmd_page(pmdval);
-	if (!page)
-	    goto pmd_unlock;
-	
-	if (!PageCompound(page)) {
-	    goto pmd_unlock;
-	}
-
-	update_huge_page(vma, pmd, page, address);
-	if (htmm_cxl_mode) {
-	    if (page_to_nid(page) == 0)
-		return 1;
-	    else
-		return 2;
-	}
-	else {
-	    if (node_is_toptier(page_to_nid(page)))
-		return 1;
-	    else
-		return 2;
-	}
+        update_huge_page(vma, pmd, page, address);
+        if (htmm_cxl_mode)
+            ret = page_to_nid(page) == 0 ? 1 : 2;
+        else
+            ret = node_is_toptier(page_to_nid(page)) ? 1 : 2;
 pmd_unlock:
-	return 0;
+        spin_unlock(ptl);
+        return ret;
     }
 
-    /* base page */
+    /* Recheck after a concurrent PMD transition before walking PTEs. */
+    if (pmd_devmap_trans_unstable(pmd))
+        return 0;
     return __update_pte_pginfo(vma, pmd, address);
 }
 

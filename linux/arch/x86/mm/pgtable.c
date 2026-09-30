@@ -44,7 +44,7 @@ pgtable_t pte_alloc_one(struct mm_struct *mm)
 
     pgtable = __pte_alloc_one(mm, __userpte_alloc_gfp);
 #ifdef CONFIG_HTMM
-    if (mm->htmm_enabled) {
+    if (pgtable && mm->htmm_enabled) {
 	__pte_alloc_pginfo(pgtable);
     }
 #endif

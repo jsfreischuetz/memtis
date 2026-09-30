@@ -77,7 +77,7 @@ static int __perf_event_open(__u64 config, __u64 config1, __u64 cpu,
     else
 	__pid = pid;
 	
-    event_fd = htmm__perf_event_open(&attr, __pid, cpu, -1, 0);
+    event_fd = htmm__perf_event_open(&attr, __pid, cpu < 10 ? cpu : cpu + 10, -1, 0);
     //event_fd = htmm__perf_event_open(&attr, -1, cpu, -1, 0);
     if (event_fd <= 0) {
 	printk("[error htmm__perf_event_open failure] event_fd: %d\n", event_fd);
